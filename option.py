@@ -1,6 +1,42 @@
 import numpy as np
 from scipy.stats import norm
 
+__all__ = ["black_scholes_price", "black_scholes_greeks"]
+
+
+def _d1_d2(
+    S: float,
+    K: float,
+    T: float,
+    r: float,
+    q: float,
+    sigma: float,
+) -> tuple[float, float]:
+    """
+    Computes d1 and d2 used in the Black-Scholes model.
+
+    Args:
+        S (float): Current stock price ($ per share).
+        K (float): Strike price ($ per share).
+        T (float): Time to expiration (years).
+        r (float): Continuously compounded risk-free interest rate (decimal, e.g., 0.05 for 5% p.a.).
+        q (float): Continuously compounded dividend yield (decimal).
+        sigma (float): Implied annualised volatility (decimal, e.g., 0.2 for 20% p.a.).
+
+    Returns:
+        tuple: A tuple containing d1 and d2.
+
+    Example:
+        >>> _d1_d2(S=100, K=110, T=1, r=0.05, q=0.03, sigma=0.2)
+    """
+    if T <= 0 or sigma <= 0:
+        return 0.0, 0.0
+
+    sqrtT = np.sqrt(T)
+    d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * sqrtT)
+    d2 = d1 - sigma * sqrtT
+    return d1, d2
+
 
 def black_scholes_price(
     S: float,
@@ -36,19 +72,30 @@ def black_scholes_price(
     if option_type not in {"call", "put"}:
         raise ValueError("Invalid option_type. Choose 'call' or 'put'.")
 
-    # Compute d1 and d2
-    d1 = (np.log(S / K) + T * (r - q + 0.5 * sigma**2)) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
+    # Edge case: at or past expiry
+    if T <= 0.0:
+        intrinsic = max(S - K, 0.0) if option_type == "call" else max(K - S, 0.0)
+        return intrinsic
+
+    # Edge case: zero volatility -> deterministic forward payoff
+    if sigma <= 0.0:
+        forward = S * np.exp((r - q) * T)
+        payoff = (
+            max(forward - K, 0.0) if option_type == "call" else max(K - forward, 0.0)
+        )
+        return np.exp(-r * T) * payoff
+
+    d1, d2 = _d1_d2(S, K, T, r, q, sigma)
+    disc_r = np.exp(-r * T)
+    disc_q = np.exp(-q * T)
 
     if option_type == "call":
-        price = S * np.exp(-q * T) * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
-    else:  # option_type == "put"
-        price = K * np.exp(-r * T) * norm.cdf(-d2) - S * np.exp(-q * T) * norm.cdf(-d1)
-
-    return round(price, 6)
+        return S * disc_q * norm.cdf(d1) - K * disc_r * norm.cdf(d2)
+    else:  # put
+        return K * disc_r * norm.cdf(-d2) - S * disc_q * norm.cdf(-d1)
 
 
-def greeks(
+def black_scholes_greeks(
     S: float,
     K: float,
     T: float,
@@ -80,31 +127,47 @@ def greeks(
     """
 
     if option_type not in {"call", "put"}:
-        raise ValueError("Invalid option_type. Choose 'call' or 'put'.")
+        raise ValueError("option_type must be 'call' or 'put'.")
 
-    # Compute d1 and d2
-    d1 = (np.log(S / K) + T * (r - q + 0.5 * sigma**2)) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
+    # Edge cases where Greeks blow up or are undefined
+    if T <= 0.0 or sigma <= 0.0:
+        return {k: np.nan for k in ("Delta", "Gamma", "Vega", "Theta", "Rho")}
 
-    # Compute Greeks
-    delta = (
-        np.exp(-q * T) * norm.cdf(d1)
-        if option_type == "call"
-        else np.exp(-q * T) * (norm.cdf(d1) - 1)
-    )
-    gamma = np.exp(-q * T) * norm.pdf(d1) / (S * sigma * np.sqrt(T))
-    vega = S * np.exp(-q * T) * norm.pdf(d1) * np.sqrt(T)
-    theta = (
-        (-S * np.exp(-q * T) * norm.pdf(d1) * sigma / (2 * np.sqrt(T)))
-        - r * K * np.exp(-r * T) * norm.cdf(d2 if option_type == "call" else -d2)
-        + q * S * np.exp(-q * T) * norm.cdf(d1 if option_type == "call" else -d1)
-    )
-    rho = K * T * np.exp(-r * T) * norm.cdf(d2 if option_type == "call" else -d2)
+    d1, d2 = _d1_d2(S, K, T, r, q, sigma)
+    disc_r = np.exp(-r * T)
+    disc_q = np.exp(-q * T)
+    sqrtT = np.sqrt(T)
+    pdf_d1 = norm.pdf(d1)
+
+    # Delta
+    if option_type == "call":
+        delta = disc_q * norm.cdf(d1)
+    else:  # put
+        delta = disc_q * (norm.cdf(d1) - 1)
+
+    # Gamma & Vega (same for call and put)
+    gamma = disc_q * pdf_d1 / (S * sigma * sqrtT)
+    vega = S * disc_q * pdf_d1 * sqrtT  # per 1.0 volatility (not %)
+
+    # Theta
+    common_term = -S * disc_q * pdf_d1 * sigma / (2 * sqrtT)
+    if option_type == "call":
+        theta = (
+            common_term - r * K * disc_r * norm.cdf(d2) + q * S * disc_q * norm.cdf(d1)
+        )
+        rho = K * T * disc_r * norm.cdf(d2)
+    else:  # put
+        theta = (
+            common_term
+            + r * K * disc_r * norm.cdf(-d2)  # sign flip
+            - q * S * disc_q * norm.cdf(-d1)  # sign flip
+        )
+        rho = -K * T * disc_r * norm.cdf(-d2)  # sign flip
 
     return {
-        "Delta": round(delta, 6),
-        "Gamma": round(gamma, 6),
-        "Vega": round(vega, 6),
-        "Theta": round(theta, 6),
-        "Rho": round(rho, 6),
+        "Delta": delta,
+        "Gamma": gamma,
+        "Vega": vega,
+        "Theta": theta,
+        "Rho": rho,
     }
