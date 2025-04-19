@@ -1,6 +1,5 @@
 import numpy as np
 import pandas as pd
-from scipy.stats import norm
 
 
 def simulate_gbm(
@@ -31,19 +30,19 @@ def simulate_gbm(
         >>> gbm_paths = simulate_gbm(S0=100, mu=0.05, sigma=0.2, dt=1/252, n_periods=252, n_paths=100)
     """
 
-    if random_state:
-        np.random.seed(random_state)
+    rng = np.random.default_rng(random_state)
 
     # Generate standard normal random shocks
-    Z = norm.rvs(size=(n_periods, n_paths))
+    Z = rng.standard_normal((n_periods, n_paths))
 
-    # Compute price changes using the GBM formula
-    dS = mu * dt + sigma * np.sqrt(dt) * Z  # GBM equation component
-    S = np.zeros((n_periods + 1, n_paths))  # Initialise price matrix
-    S[0] = S0  # Set initial price for all paths
+    # Compute log-returns using the exact GBM formulation:
+    # dS/S = (mu - 0.5 * sigma^2) * dt + sigma * sqrt(dt) * Z
+    log_returns = (mu - 0.5 * sigma**2) * dt + sigma * np.sqrt(dt) * Z
 
-    # Apply GBM formula recursively (vectorised)
-    for t in range(1, n_periods + 1):
-        S[t] = S[t - 1] * (1 + dS[t - 1])  # This follows S_{t + 1} = S_t * exp(dS)
+    # Calculate cumulative log returns and compute the price paths
+    cumulative_log_returns = np.vstack(
+        [np.zeros((1, n_paths)), np.cumsum(log_returns, axis=0)]
+    )
+    S = S0 * np.exp(cumulative_log_returns)
 
     return pd.DataFrame(S)
