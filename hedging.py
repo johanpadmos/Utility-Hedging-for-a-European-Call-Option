@@ -1,12 +1,93 @@
-from typing import Callable, Optional, Union
+# hedging.py
+"""
+Delta- and utility-based hedging simulators.
 
+Example
+-------
+>>> from hedging import delta_hedging
+>>> results = delta_hedging(
+...     S0=100.0, K=105.0, T=1.0,
+...     sigma=0.20, r=0.03, dt=1/252,
+...     n_periods=252, hedging_frequency=21,
+...     option_type="call",
+... )
+"""
+
+from __future__ import annotations
+
+from typing import Callable, Final, Optional
+
+import numpy as np
 import pandas as pd
 
 from gbm import simulate_gbm
-from option import black_scholes_price, greeks
+from option import black_scholes_greeks, black_scholes_price
+from transaction import dynamic_trans_cost as _static_trans_cost  # for typing only
+
+__all__: Final = [
+    "delta_hedging",
+    "utility_based_hedging",
+]
+
+# ---------------------------------------------------------------------------
+# Type aliases
+# ---------------------------------------------------------------------------
+
+VolFunc = Callable[[int, float], float]
+TransCostFunc = Callable[[int, float], float]  # same (time_idx, price) signature
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _coerce_prices(
+    prices: pd.Series | pd.DataFrame | np.ndarray,
+) -> pd.Series:
+    """
+    Convert any 1‑D price container to a pandas Series with a RangeIndex.
+    """
+    if isinstance(prices, pd.DataFrame):
+        prices = prices.iloc[:, 0]
+    if isinstance(prices, np.ndarray):
+        prices = pd.Series(prices.flatten())
+    if not isinstance(prices, pd.Series):
+        raise TypeError("stock_prices must be 1‑D ndarray, Series or DataFrame.")
+    return prices.reset_index(drop=True)
+
+
+def _resolve_sigma(
+    vol_model: VolFunc | bool,
+    fallback_sigma: float,
+    t_idx: int,
+    price: float,
+) -> float:
+    """
+    Either call the `vol_model` or return the static `fallback_sigma`.
+    """
+    return vol_model(t_idx, price) if callable(vol_model) else fallback_sigma
+
+
+def _resolve_trans_cost(
+    tc_model: TransCostFunc | bool,
+    fallback_tc: float,
+    t_idx: int,
+    price: float,
+) -> float:
+    """
+    Either call the `tc_model` or return the static `fallback_tc`.
+    """
+    return tc_model(t_idx, price) if callable(tc_model) else fallback_tc
+
+
+# ---------------------------------------------------------------------------
+# Delta‑hedging
+# ---------------------------------------------------------------------------
 
 
 def delta_hedging(
+    *,
     S0: float,
     K: float,
     T: float,
@@ -18,181 +99,112 @@ def delta_hedging(
     option_type: str,
     q: float = 0.0,
     transaction_cost: float = 0.0,
-    random_state: int = None,
-    dynamic_vol: Union[bool, Callable[[int, float], float]] = False,
-    dynamic_trans_cost: Union[bool, Callable[[int, float], float]] = False,
-    stock_prices: Optional[pd.Series] = None,
-) -> dict:
+    random_state: int | None = None,
+    dynamic_vol: VolFunc | bool = False,
+    dynamic_trans_cost: TransCostFunc | bool = False,
+    stock_prices: Optional[pd.Series | pd.DataFrame | np.ndarray] = None,
+) -> dict[str, object]:
     """
-    Simulates a delta hedging strategy for a European option (call or put) over the entire strategy duration.
+    Simulate a *classic* delta‑hedging strategy for one European option.
 
-    This function generates a stock price path using a Geometric Brownian Motion (GBM) model
-    unless a pre-computed price series is provided via `stock_prices`. It then computes the option
-    prices and corresponding delta values at each time step, rebalancing the hedging portfolio
-    according to the specified hedging frequency. Transaction costs are incorporated into the cash
-    account when trades occur.
-
-    Args:
-        S0 (float): Initial stock price (used if stock_prices is not provided).
-        K (float): Strike price of the option.
-        T (float): Time to expiration (in years).
-        sigma (float): Static volatility for GBM simulation (used if dynamic_vol is False).
-        r (float): Risk-free interest rate (annualized).
-        dt (float): Time step as a fraction of a year (e.g., 1/252 for daily steps).
-        n_periods (int): Total number of periods for the simulation.
-        hedging_frequency (int): Number of periods between each hedging rebalance.
-        option_type (str): "call" or "put" indicating the type of option.
-        q (float, optional): Continuous dividend yield. Defaults to 0.0.
-        transaction_cost (float, optional): Static proportional transaction cost per trade.
-            Defaults to 0.0.
-        random_state (int, optional): Seed for random number generation for reproducibility.
-        dynamic_vol (bool or callable, optional): If True or a callable is provided, a dynamic
-            volatility model (e.g., GARCH) will be used to update sigma over time. If False,
-            the static sigma value is used. Defaults to False.
-        dynamic_trans_cost (bool or callable, optional): If True or a callable is provided, a dynamic
-            transaction cost model will be used. If False, the static transaction_cost value is used.
-            Defaults to False.
-        stock_prices (pd.Series, optional): Pre-computed stock price series to use instead of
-            generating one via GBM. If provided, its length should match n_periods + 1.
-
-    Returns:
-        dict: A dictionary containing the following simulation outputs:
-            - "stock_prices": The stock price series used (generated or provided).
-            - "option_prices": The computed option prices over time.
-            - "delta_values": The delta (hedge ratio) values at each time step.
-            - "cash_account": The evolution of the cash account over time, including trade costs.
-            - "total_pnl": The total profit and loss of the hedging strategy.
-            - "transaction_costs": The cumulative transaction costs incurred.
+    Returns
+    -------
+    dict
+        Keys: ``stock_prices``, ``option_prices``, ``delta_values``,
+        ``cash_account``, ``total_pnl``, ``transaction_costs``.
     """
 
-    # Helper function to obtain transaction cost factor at a given time step and price.
-    def get_trans_cost(time_index: int, current_price: float) -> float:
-        if callable(dynamic_trans_cost):
-            return dynamic_trans_cost(time_index, current_price)
-        else:
-            return transaction_cost
-
-    # If a pre-computed stock price series is not provided, simulate one using the GBM function.
+    # ---------------------------- price path ------------------------------
     if stock_prices is None:
-        simulated = simulate_gbm(
+        prices = simulate_gbm(
             S0,
-            mu=r,  #  note mu=r as we assume risk neutral pricing
+            mu=r,  # risk‑neutral drift
             sigma=sigma,
             dt=dt,
             n_periods=n_periods,
             n_paths=1,
             random_state=random_state,
         )
-        # Ensure we have a pd.Series
-        if isinstance(simulated, pd.DataFrame):
-            stock_prices = simulated.iloc[:, 0]
-        else:
-            stock_prices = simulated
     else:
-        # If provided as a DataFrame, take the first column.
-        if isinstance(stock_prices, pd.DataFrame):
-            stock_prices = stock_prices.iloc[:, 0]
+        prices = stock_prices
 
-    # Initialise lists to track simulation outputs.
-    option_prices = []
-    delta_values = []
-    cash_account = []
+    stock_prices_ser = _coerce_prices(prices)
 
-    # Initialise total transaction cost accumulator.
-    transaction_costs_total = 0.0
+    # ---------------------------- containers ------------------------------
+    option_prices: list[float] = []
+    delta_vals: list[float] = []
+    cash_account: list[float] = []
 
-    # --- INITIALISATION AT TIME 0 ---
-    t0 = 0.0
-    T_remaining = T - t0
+    trans_cost_cum = 0.0
 
-    # Determine current volatility: use dynamic_vol callable if provided; otherwise static.
-    current_sigma = sigma
-    if callable(dynamic_vol):
-        current_sigma = dynamic_vol(0, S0)
+    # ---------------------------- t = 0 -----------------------------------
+    sigma_t = _resolve_sigma(dynamic_vol, sigma, 0, S0)
+    opt_price_0 = black_scholes_price(S0, K, T, sigma_t, r, option_type, q)
+    delta_t = black_scholes_greeks(S0, K, T, sigma_t, r, option_type, q)["Delta"]
 
-    # Compute initial option price and Greeks using the provided option_type.
-    option_price_0 = black_scholes_price(
-        S0, K, T_remaining, current_sigma, r, option_type, q
-    )
-    greeks_dict = greeks(S0, K, T_remaining, current_sigma, r, option_type, q)
-    delta_current = greeks_dict["Delta"]
+    stock_pos = -delta_t  # short option ⇒ hold −Δ shares
+    tc0 = _resolve_trans_cost(dynamic_trans_cost, transaction_cost, 0, S0)
+    cash = opt_price_0 - stock_pos * S0 * (1 + tc0)
 
-    # For a short option position, the hedge is to hold -delta shares.
-    stock_position = -delta_current
-
-    # Compute initial transaction cost for setting up the hedge.
-    trans_cost = get_trans_cost(0, S0)
-    # Assume we receive the option premium when selling the option.
-    cash = option_price_0 - (stock_position * S0 * (1 + trans_cost))
-
-    # Record initial values.
-    option_prices.append(option_price_0)
-    delta_values.append(delta_current)
+    # record
+    option_prices.append(opt_price_0)
+    delta_vals.append(delta_t)
     cash_account.append(cash)
 
-    # --- MAIN LOOP: Iterate Through Each Time Step ---
+    # -------------------- main simulation loop ----------------------------
     for i in range(1, n_periods + 1):
         t = i * dt
-        T_remaining = T - t
-        S_t = stock_prices.iloc[i]
+        S_t = float(stock_prices_ser.iloc[i])
+        T_rem = max(T - t, 0.0)
 
-        # Update volatility if dynamic.
-        current_sigma = sigma
-        if callable(dynamic_vol):
-            current_sigma = dynamic_vol(i, S_t)
+        sigma_t = _resolve_sigma(dynamic_vol, sigma, i, S_t)
 
-        # Compute option price and Greeks at current time.
-        if T_remaining > 0:
-            option_price = black_scholes_price(
-                S_t, K, T_remaining, current_sigma, r, option_type, q
-            )
-            greeks_dict = greeks(S_t, K, T_remaining, current_sigma, r, option_type, q)
-            delta_new = greeks_dict["Delta"]
-        else:
-            # At expiration: for a call, payoff = max(S-K, 0); for a put, payoff = max(K-S, 0)
-            option_price = max(S_t - K, 0) if option_type == "call" else max(K - S_t, 0)
+        if T_rem > 0:
+            opt_price = black_scholes_price(S_t, K, T_rem, sigma_t, r, option_type, q)
+            delta_new = black_scholes_greeks(S_t, K, T_rem, sigma_t, r, option_type, q)[
+                "Delta"
+            ]
+        else:  # final payoff
+            opt_price = max(S_t - K, 0) if option_type == "call" else max(K - S_t, 0)
             delta_new = 0.0
 
-        option_prices.append(option_price)
-        delta_values.append(delta_new)
+        option_prices.append(opt_price)
+        delta_vals.append(delta_new)
 
-        # Rebalance the hedge at specified hedging frequency (or at final time).
+        # ------------- rebalance if on a hedge date or final step ----------
         if i % hedging_frequency == 0 or i == n_periods:
-            desired_stock_position = -delta_new
-            trade_shares = desired_stock_position - stock_position
+            desired_pos = -delta_new
+            trade = desired_pos - stock_pos
 
-            # Compute transaction cost for this trade.
-            trans_cost = get_trans_cost(i, S_t)
-            trade_cost = abs(trade_shares * S_t) * trans_cost
-            transaction_costs_total += trade_cost
-
-            # Update cash: subtract cost of buying (or add if selling) shares and transaction cost.
-            cash -= trade_shares * S_t + trade_cost
-            stock_position = desired_stock_position
+            tc = _resolve_trans_cost(dynamic_trans_cost, transaction_cost, i, S_t)
+            cash -= trade * S_t + abs(trade * S_t) * tc  # pay for shares + costs
+            trans_cost_cum += abs(trade * S_t) * tc
+            stock_pos = desired_pos
 
         cash_account.append(cash)
 
-    # --- FINAL PORTFOLIO CALCULATION ---
-    S_final = stock_prices.iloc[-1]
-    # At expiration, compute the option payoff based on option type.
-    if option_type == "call":
-        option_payoff = max(S_final - K, 0)
-    else:
-        option_payoff = max(K - S_final, 0)
-    portfolio_value = cash + stock_position * S_final - option_payoff
-    total_pnl = portfolio_value
+    # ---------------------------- closure ---------------------------------
+    S_final = float(stock_prices_ser.iloc[-1])
+    payoff = max(S_final - K, 0) if option_type == "call" else max(K - S_final, 0)
+    total_pnl = cash + stock_pos * S_final - payoff
 
     return {
-        "stock_prices": stock_prices,
+        "stock_prices": stock_prices_ser,
         "option_prices": option_prices,
-        "delta_values": delta_values,
+        "delta_values": delta_vals,
         "cash_account": cash_account,
         "total_pnl": total_pnl,
-        "transaction_costs": transaction_costs_total,
+        "transaction_costs": trans_cost_cum,
     }
 
 
+# ---------------------------------------------------------------------------
+# Utility‑based hedging with no‑trade band
+# ---------------------------------------------------------------------------
+
+
 def utility_based_hedging(
+    *,
     S0: float,
     K: float,
     T: float,
@@ -204,199 +216,117 @@ def utility_based_hedging(
     option_type: str,
     q: float = 0.0,
     transaction_cost: float = 0.0,
-    risk_aversion: float = 1.0,
+    risk_aversion: float = 1.0,  # reserved for future extensions
     no_trade_multiplier: float = 1.0,
-    random_state: int = None,
-    dynamic_vol: Union[bool, Callable[[int, float], float]] = False,
-    dynamic_trans_cost: Union[bool, Callable[[int, float], float]] = False,
-    stock_prices: Optional[pd.Series] = None,
-) -> dict:
+    random_state: int | None = None,
+    dynamic_vol: VolFunc | bool = False,
+    dynamic_trans_cost: TransCostFunc | bool = False,
+    stock_prices: Optional[pd.Series | pd.DataFrame | np.ndarray] = None,
+) -> dict[str, object]:
     """
-    Simulates a utility-based hedging strategy for a European option over the entire strategy duration.
+    Utility‑based hedging with *no‑trade* region (Zakamouline‑style).
 
-    This function uses a no-trade (inaction) region approach inspired by Zakamouline (2006). Instead
-    of continuously rebalancing to the frictionless (ideal) hedge ratio, the hedge is adjusted only
-    when the deviation between the current hedge and the frictionless hedge exceeds a threshold.
-
-    The threshold (half-width of the no-trade region) is given by:
-
-        b = no_trade_multiplier * (transaction_cost)^(1/3)
-
-    The ideal hedge is computed as:
-
-        ideal_hedge = -target_delta
-
-    and the no-trade region is defined as:
-
-        [ideal_hedge - b,  ideal_hedge + b]
-
-    Args:
-        S0 (float): Initial stock price (used if stock_prices is not provided).
-        K (float): Strike price of the option.
-        T (float): Time to expiration (in years).
-        sigma (float): Static volatility for GBM simulation (used if dynamic_vol is False).
-        r (float): Risk-free interest rate (annualized).
-        dt (float): Time step as a fraction of a year (e.g., 1/252 for daily steps).
-        n_periods (int): Total number of periods for the simulation.
-        hedging_frequency (int): Number of periods between each hedging rebalance.
-        option_type (str): "call" or "put".
-        q (float, optional): Continuous dividend yield. Defaults to 0.0.
-        transaction_cost (float, optional): Static proportional transaction cost per trade.
-            Defaults to 0.0.
-        risk_aversion (float, optional): Risk aversion parameter (may be used for further extensions). Defaults to 1.0.
-        no_trade_multiplier (float, optional): Multiplier to scale the no-trade region half-width. Defaults to 1.0.
-        random_state (int, optional): Seed for random number generation for reproducibility.
-        dynamic_vol (bool or callable, optional): If True or a callable is provided, a dynamic
-            volatility model (e.g., GARCH) will be used to update sigma over time. If False,
-            the static sigma value is used. Defaults to False.
-        dynamic_trans_cost (bool or callable, optional): If True or a callable is provided, a dynamic
-            transaction cost model will be used. If False, the static transaction_cost value is used.
-            Defaults to False.
-        stock_prices (pd.Series, optional): Pre-computed stock price series to use instead of
-            generating one via GBM. If provided, its length should match n_periods + 1.
-
-    Returns:
-        dict: A dictionary containing:
-            - "stock_prices": The stock price series used (generated or provided).
-            - "option_prices": The computed option prices over time.
-            - "frictionless_deltas": The frictionless (ideal) delta values at each time step.
-            - "hedge_positions": The actual hedge positions (stock holdings) over time.
-            - "cash_account": The evolution of the cash account over time (including trade costs).
-            - "total_pnl": The total profit and loss of the hedging strategy.
-            - "transaction_costs": The cumulative transaction costs incurred.
+    Returns
+    -------
+    dict
+        Keys: ``stock_prices``, ``option_prices``, ``frictionless_deltas``,
+        ``hedge_positions``, ``cash_account``, ``total_pnl``,
+        ``transaction_costs``.
     """
 
-    def get_trans_cost(time_index: int, current_price: float) -> float:
-        if callable(dynamic_trans_cost):
-            return dynamic_trans_cost(time_index, current_price)
-        else:
-            return transaction_cost
-
-    # Define no-trade half-width based on the asymptotic result.
-    no_trade_half_width = no_trade_multiplier * (transaction_cost) ** (1 / 3)
-
-    # Obtain stock price series via GBM if not provided.
+    # price path
     if stock_prices is None:
-        simulated = simulate_gbm(
+        prices = simulate_gbm(
             S0,
-            mu=r,  # risk-neutral assumption: mu = r
+            mu=r,
             sigma=sigma,
             dt=dt,
             n_periods=n_periods,
             n_paths=1,
             random_state=random_state,
         )
-        if isinstance(simulated, pd.DataFrame):
-            stock_prices = simulated.iloc[:, 0]
-        else:
-            stock_prices = simulated
     else:
-        if isinstance(stock_prices, pd.DataFrame):
-            stock_prices = stock_prices.iloc[:, 0]
+        prices = stock_prices
 
-    # Initialize output lists.
-    option_prices = []
-    frictionless_deltas = []
-    hedge_positions = []
-    cash_account = []
-    transaction_costs_total = 0.0
+    stock_prices_ser = _coerce_prices(prices)
 
-    # --- INITIALIZATION AT TIME 0 ---
-    t0 = 0.0
-    T_remaining = T - t0
-    current_sigma = sigma
-    if callable(dynamic_vol):
-        current_sigma = dynamic_vol(0, S0)
+    no_trade_half = no_trade_multiplier * transaction_cost ** (1 / 3)
 
-    option_price_0 = black_scholes_price(
-        S0, K, T_remaining, current_sigma, r, option_type, q
-    )
-    greeks_dict = greeks(S0, K, T_remaining, current_sigma, r, option_type, q)
-    target_delta = greeks_dict["Delta"]
-    # For a short option, ideal hedge is:
-    ideal_hedge = target_delta
+    # containers
+    option_prices: list[float] = []
+    frictionless_deltas: list[float] = []
+    hedge_pos_list: list[float] = []
+    cash_account: list[float] = []
 
-    # Set initial hedge position to the ideal hedge.
-    hedge_position = ideal_hedge
-    frictionless_deltas.append(target_delta)
-    option_prices.append(option_price_0)
-    hedge_positions.append(hedge_position)
+    trans_cost_cum = 0.0
 
-    # Set initial cash: assume you receive the option premium when selling the option.
-    trans_cost = get_trans_cost(0, S0)
-    cash = option_price_0 - (hedge_position * S0 * (1 + trans_cost))
+    # t = 0
+    sigma_t = _resolve_sigma(dynamic_vol, sigma, 0, S0)
+    opt_price_0 = black_scholes_price(S0, K, T, sigma_t, r, option_type, q)
+    delta_star = black_scholes_greeks(S0, K, T, sigma_t, r, option_type, q)["Delta"]
+
+    hedge_pos = delta_star
+    tc0 = _resolve_trans_cost(dynamic_trans_cost, transaction_cost, 0, S0)
+    cash = opt_price_0 - hedge_pos * S0 * (1 + tc0)
+
+    option_prices.append(opt_price_0)
+    frictionless_deltas.append(delta_star)
+    hedge_pos_list.append(hedge_pos)
     cash_account.append(cash)
 
-    # --- MAIN LOOP: Iterate Through Each Time Step ---
+    # main loop
     for i in range(1, n_periods + 1):
+        S_t = float(stock_prices_ser.iloc[i])
         t = i * dt
-        T_remaining = T - t
-        S_t = stock_prices.iloc[i]
+        T_rem = max(T - t, 0.0)
 
-        # Update volatility if using a dynamic model.
-        current_sigma = sigma
-        if callable(dynamic_vol):
-            current_sigma = dynamic_vol(i, S_t)
+        sigma_t = _resolve_sigma(dynamic_vol, sigma, i, S_t)
 
-        # Compute frictionless option price and delta.
-        if T_remaining > 0:
-            option_price = black_scholes_price(
-                S_t, K, T_remaining, current_sigma, r, option_type, q
-            )
-            greeks_dict = greeks(S_t, K, T_remaining, current_sigma, r, option_type, q)
-            target_delta = greeks_dict["Delta"]
+        if T_rem > 0:
+            opt_price = black_scholes_price(S_t, K, T_rem, sigma_t, r, option_type, q)
+            delta_star = black_scholes_greeks(
+                S_t, K, T_rem, sigma_t, r, option_type, q
+            )["Delta"]
         else:
-            # At expiration: payoff and delta are determined by the option's payoff.
-            if option_type == "call":
-                option_price = max(S_t - K, 0)
-            else:
-                option_price = max(K - S_t, 0)
-            target_delta = 0.0
+            opt_price = max(S_t - K, 0) if option_type == "call" else max(K - S_t, 0)
+            delta_star = 0.0
 
-        frictionless_deltas.append(target_delta)
-        option_prices.append(option_price)
-        # Recalculate ideal hedge as the negative of frictionless delta.
-        ideal_hedge = target_delta
+        option_prices.append(opt_price)
+        frictionless_deltas.append(delta_star)
 
-        # Define the no-trade region directly around the ideal hedge.
-        lower_bound = ideal_hedge - no_trade_half_width
-        upper_bound = ideal_hedge + no_trade_half_width
+        # no‑trade band
+        lower, upper = delta_star - no_trade_half, delta_star + no_trade_half
 
-        # Rebalance only at the specified frequency or at final time.
         if i % hedging_frequency == 0 or i == n_periods:
-            if hedge_position < lower_bound:
-                desired_position = lower_bound
-            elif hedge_position > upper_bound:
-                desired_position = upper_bound
+            if hedge_pos < lower:
+                desired = lower
+            elif hedge_pos > upper:
+                desired = upper
             else:
-                desired_position = hedge_position
+                desired = hedge_pos
 
-            trade_shares = desired_position - hedge_position
-            trans_cost = get_trans_cost(i, S_t)
-            trade_cost = abs(trade_shares * S_t) * trans_cost
-            transaction_costs_total += trade_cost
+            trade = desired - hedge_pos
+            tc = _resolve_trans_cost(dynamic_trans_cost, transaction_cost, i, S_t)
+            cost = abs(trade * S_t) * tc
+            cash -= trade * S_t + cost
+            trans_cost_cum += cost
 
-            cash -= trade_shares * S_t + trade_cost
-            hedge_position = desired_position
+            hedge_pos = desired
 
-        hedge_positions.append(hedge_position)
+        hedge_pos_list.append(hedge_pos)
         cash_account.append(cash)
 
-    # --- FINAL PORTFOLIO CALCULATION ---
-    S_final = stock_prices.iloc[-1]
-    if option_type == "call":
-        option_payoff = max(S_final - K, 0)
-    else:
-        option_payoff = max(K - S_final, 0)
-    portfolio_value = cash + hedge_position * S_final - option_payoff
-    total_pnl = portfolio_value
+    # wrap‑up
+    S_final = float(stock_prices_ser.iloc[-1])
+    payoff = max(S_final - K, 0) if option_type == "call" else max(K - S_final, 0)
+    total_pnl = cash + hedge_pos * S_final - payoff
 
     return {
-        "stock_prices": stock_prices,
+        "stock_prices": stock_prices_ser,
         "option_prices": option_prices,
         "frictionless_deltas": frictionless_deltas,
-        "hedge_positions": hedge_positions,
+        "hedge_positions": hedge_pos_list,
         "cash_account": cash_account,
         "total_pnl": total_pnl,
-        "transaction_costs": transaction_costs_total,
+        "transaction_costs": trans_cost_cum,
     }
