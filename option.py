@@ -1,35 +1,21 @@
+# black_scholes.py
+"""
+Black-Scholes pricing and Greeks for European options (continuous yield q).
+"""
+
 import numpy as np
 from scipy.stats import norm
 
 __all__ = ["black_scholes_price", "black_scholes_greeks"]
 
 
-def _d1_d2(
-    S: float,
-    K: float,
-    T: float,
-    r: float,
-    q: float,
-    sigma: float,
-) -> tuple[float, float]:
+def _d1_d2(S: float, K: float, T: float, r: float, q: float, sigma: float):
     """
-    Computes d1 and d2 used in the Black-Scholes model.
-
-    Args:
-        S (float): Current stock price ($ per share).
-        K (float): Strike price ($ per share).
-        T (float): Time to expiration (years).
-        r (float): Continuously compounded risk-free interest rate (decimal, e.g., 0.05 for 5% p.a.).
-        q (float): Continuously compounded dividend yield (decimal).
-        sigma (float): Implied annualised volatility (decimal, e.g., 0.2 for 20% p.a.).
-
-    Returns:
-        tuple: A tuple containing d1 and d2.
-
-    Example:
-        >>> _d1_d2(S=100, K=110, T=1, r=0.05, q=0.03, sigma=0.2)
+    Return (d1, d2) used by Black–Scholes formulas.
     """
     if T <= 0 or sigma <= 0:
+        # These values are never used when T<=0 or sigma<=0,
+        # but return something sensible to avoid NaNs in edge handling.
         return 0.0, 0.0
 
     sqrtT = np.sqrt(T)
@@ -48,36 +34,43 @@ def black_scholes_price(
     q: float = 0.0,
 ) -> float:
     """
-    Computes the Black-Scholes price of a European option.
+    Black–Scholes price for a European call or put.
 
-    Args:
-        S (float): Current stock price ($ per share).
-        K (float): Strike price ($ per share).
-        T (float): Time to expiration (years).
-        sigma (float): Implied annualised volatility (decimal, e.g., 0.2 for 20% p.a.).
-        r (float): Continuously compounded risk-free interest rate (decimal, e.g., 0.05 for 5% p.a.).
-        option_type (str): "call" or "put".
-        q (float, optional): Continuously compounded dividend yield (decimal). Defaults to 0.
+    Parameters
+    ----------
+    S, K : float
+        Spot price and strike.
+    T : float
+        Time to expiry in years.
+    sigma : float
+        Volatility (annualised, in decimals).
+    r : float
+        Continuous risk‑free rate.
+    option_type : {"call", "put"}
+        Option flavour.
+    q : float, default 0.0
+        Continuous dividend yield.
 
-    Returns:
-        float: Option price ($ per share).
+    Returns
+    -------
+    float
+        Option present value.
 
-    Raises:
-        ValueError: If `option_type` is not 'call' or 'put'.
-
-    Example:
-        >>> black_scholes_price(S=100, K=110, T=1, sigma=0.2, r=0.05, option_type="put")
+    Notes
+    -----
+    * If T <= 0 the intrinsic value is returned.
+    * If sigma <= 0 the value reduces to the discounted deterministic payoff.
     """
 
     if option_type not in {"call", "put"}:
-        raise ValueError("Invalid option_type. Choose 'call' or 'put'.")
+        raise ValueError("option_type must be 'call' or 'put'.")
 
     # Edge case: at or past expiry
     if T <= 0.0:
         intrinsic = max(S - K, 0.0) if option_type == "call" else max(K - S, 0.0)
         return intrinsic
 
-    # Edge case: zero volatility -> deterministic forward payoff
+    # Edge case: zero volatility ⇒ deterministic forward payoff
     if sigma <= 0.0:
         forward = S * np.exp((r - q) * T)
         payoff = (
@@ -105,25 +98,10 @@ def black_scholes_greeks(
     q: float = 0.0,
 ) -> dict:
     """
-    Computes the key Greeks for a European option using the Black-Scholes model.
+    Return Delta, Gamma, Vega, Theta, Rho for a European option.
 
-    Args:
-        S (float): Current stock price ($ per share).
-        K (float): Strike price ($ per share).
-        T (float): Time to expiration (years).
-        sigma (float): Implied annualised volatility (decimal, e.g. 0.2 for 20% p.a.).
-        r (float): Continuously comounded risk-free interest rate (decimal, e.g., 0.05 for 5% p.a.).
-        option_type (str): "call" or "put".
-        q (float, optional): Continuous dividend yield (decimal, e.g. 0.03 for 3% p.a.). Defaults to 0.
-
-    Returns:
-        dict: A dictionary containing Delta, Gamma, Vega, Theta, and Rho.
-
-    Raises:
-        ValueError: If `option_type` is not 'call' or 'put'.
-
-    Examples:
-        >>> greeks(S=100, K=110, T=1, sigma=0.2, r=0.05, option_type="put", q=0.03)
+    For T==0 or sigma==0, Greeks whose theoretical value
+    is undefined are returned as np.nan.
     """
 
     if option_type not in {"call", "put"}:
