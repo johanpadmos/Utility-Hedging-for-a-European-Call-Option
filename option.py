@@ -1,4 +1,4 @@
-# black_scholes.py
+# option.py
 """
 Black-Scholes pricing and Greeks for European options (continuous yield q).
 """
@@ -11,7 +11,7 @@ __all__ = ["black_scholes_price", "black_scholes_greeks"]
 
 def _d1_d2(S: float, K: float, T: float, r: float, q: float, sigma: float):
     """
-    Return (d1, d2) used by Black–Scholes formulas.
+    Return (d1, d2) used by Black-Scholes formulas.
     """
     if T <= 0 or sigma <= 0:
         # These values are never used when T<=0 or sigma<=0,
@@ -45,7 +45,7 @@ def black_scholes_price(
     sigma : float
         Volatility (annualised, in decimals).
     r : float
-        Continuous risk‑free rate.
+        Continuous risk-free rate.
     option_type : {"call", "put"}
         Option flavour.
     q : float, default 0.0
