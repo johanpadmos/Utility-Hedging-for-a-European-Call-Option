@@ -1,0 +1,8 @@
+numpy
+pandas
+matplotlib
+scipy
+tqdm
+
+# Optional: for LaTeX-style rendering
+# Requires LaTeX installed separately on your system
